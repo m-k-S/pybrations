@@ -68,9 +68,6 @@ class MinimalOCPCalculator:
         with torch.amp.autocast('cuda', enabled=self.trainer.scaler is not None):
             out = self.trainer._forward(batch_object)
 
-        grad_first = torch.autograd.grad(out['forces'].sum(), batch_object.pos, allow_unused=True)[0]
-        print(grad_first)  # Should not be None 
-
         # target_key = 'forces'
         # pred = self.trainer._denorm_preds(target_key, out[target_key], batch)
 
@@ -93,29 +90,90 @@ atoms = read('AgI.cif')
 ocp = MinimalOCPCalculator('models/eqV2_31M_omat_mp_salex.pt')
 
 # Make prediction
-# results = ocp.predict(atoms)
 positions, forces = ocp.predict(atoms)
-# forces = results['forces'][0] # if there is only one material
-# positions = results['positions'][0] # if there is only one material
+n_atoms = positions.shape[0]
 
-grad_first = torch.autograd.grad(forces.sum(), positions, allow_unused=True)[0]
-print(grad_first)  # Should not be None
+# may want to reshape this in the future
+hessian = torch.zeros((n_atoms * 3, n_atoms * 3), dtype=positions.dtype, device=positions.device)
 
+for i in range(n_atoms):
+    for alpha in range(3):  # x, y, z
+        force_component = forces[i, alpha]  # Select F_i^α
 
-# n_atoms = positions.shape[0]
-# hessian = torch.zeros((n_atoms * 3, n_atoms * 3), dtype=positions.dtype, device=positions.device)
+        # Compute first derivative dF_i^α / d r_j^β
+        grad_outputs = torch.zeros_like(forces)
+        grad_outputs[i, alpha] = 1.0  # Select specific component
+        grad_first = torch.autograd.grad(forces, positions, grad_outputs=grad_outputs, create_graph=True)[0]
 
-# for i in range(n_atoms):
-#     for alpha in range(3):  # x, y, z
-#         force_component = forces[i, alpha]  # Select F_i^α
+        for j in range(n_atoms):
+            for beta in range(3):
+                hessian[i * 3 + alpha, j * 3 + beta] = grad_first[j, beta]  # Store dF_i^α / dr_j^β
 
-#         # Compute first derivative dF_i^α / d r_j^β
-#         grad_outputs = torch.zeros_like(forces)
-#         grad_outputs[i, alpha] = 1.0  # Select specific component
-#         grad_first = torch.autograd.grad(forces, positions, grad_outputs=grad_outputs, create_graph=True)[0]
+# Save the Hessian matrix to a torch file
+torch.save(hessian, 'hessian.pt')
+print (hessian.shape)
 
-#         for j in range(n_atoms):
-#             for beta in range(3):
-#                 hessian[i * 3 + alpha, j * 3 + beta] = grad_first[j, beta]  # Store dF_i^α / dr_j^β
+import ase 
+import numpy as np
 
-# print (hessian)
+masses = ase.data.atomic_masses[atoms.get_atomic_numbers()]
+
+npoints = 100
+
+rec_vecs = 2 * np.pi * atoms.cell.reciprocal().real
+mp_band_path = atoms.cell.bandpath(npoints=npoints)
+
+all_kpts = mp_band_path.kpts @ rec_vecs
+all_eigs = []
+
+def sqrt(x):
+    return np.sign(x) * np.sqrt(np.abs(x))
+
+def dynamical_matrix(kpt, atoms, H, masses):
+    r"""Dynamical matrix at a given k-point.
+
+    .. math::
+
+        D_{ij}(\vec k) = \hat H_{ij}(\vec k) / \sqrt{m_i m_j}
+
+    """
+    r = atoms.get_positions()
+    ph = np.exp(-1j * np.dot(r[:, None, :] - r[None, :, :], kpt))[:, None, :, None]
+    # a = graph.nodes.index_cell0
+    a = [i for i in range(len(r))]
+    i = np.arange(3)
+    Hk = (
+        np.zeros((n_atoms, 3, n_atoms, 3), dtype=ph.dtype)
+        .at[np.ix_(a, i, a, i)]
+        .add(ph * H)
+    )
+    Hk = Hk.reshape((masses.size, 3, masses.size, 3))
+
+    iM = 1 / np.sqrt(masses)
+    Hk = np.einsum("i,iujv,j->iujv", iM, Hk, iM)
+    Hk = Hk.reshape((3 * masses.size, 3 * masses.size))
+    return Hk
+
+for kpt in tqdm(all_kpts):
+    Dk = dynamical_matrix(kpt, atoms, hessian, masses)
+    Dk = np.asarray(Dk)
+    all_eigs.append(np.sort(sqrt(np.linalg.eigh(Dk)[0])))
+
+#     all_eigs = np.stack(all_eigs)
+
+#     eV_to_J = 1.60218e-19
+#     angstrom_to_m = 1e-10
+#     atom_mass = 1.660599e-27  # kg
+#     hbar = 1.05457182e-34
+#     cm_inv = (0.124e-3) * (1.60218e-19)  # in J
+#     conv_const = eV_to_J / (angstrom_to_m**2) / atom_mass
+
+#     all_eigs = all_eigs * np.sqrt(conv_const) * hbar / cm_inv
+
+#     bs = ase.spectrum.band_structure.BandStructure(mp_band_path, all_eigs[None])
+
+#     plt.figure(figsize=(7, 6), dpi=100)
+#     bs.plot(ax=plt.gca(), emin=1.1 * np.min(all_eigs), emax=1.1 * np.max(all_eigs))
+#     plt.ylabel("Phonon Frequency (cm$^{-1}$)")
+#     plt.tight_layout()
+#     return plt.gcf()
